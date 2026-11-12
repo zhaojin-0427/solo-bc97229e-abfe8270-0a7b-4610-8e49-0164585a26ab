@@ -1,7 +1,8 @@
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    DATABASE_PATH=/data/aircargo.db
 
 WORKDIR /app
 
@@ -10,7 +11,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-RUN useradd --create-home --uid 10001 appuser && chown -R appuser /app
+RUN useradd --create-home --uid 10001 appuser \
+ && mkdir -p /data \
+ && chown -R appuser:appuser /app /data
 USER appuser
 
 EXPOSE 8000

@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+from datetime import date
 from typing import Annotated
 
-from fastapi import Body, FastAPI
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from . import solver
+from . import db, solver
 from .schemas import (
+    DailyReportResponse,
     ErrorResponse,
+    IngestBatch,
+    IngestConflictResponse,
+    IngestResponse,
     InvalidRecordInfo,
     LinkInfo,
     NormalizeRequest,
     NormalizeResponse,
     RecordOut,
+    RevisionConflictDetail,
     Summary,
 )
 
@@ -32,6 +39,9 @@ Normalize carrier-exported local scan times to UTC under IANA timezone rules.
 * If any record has no legal candidate, or the links are mutually inconsistent,
   the request fails with **HTTP 409** and a precise reason — no partial
   conversion is ever returned.
+
+It also ingests late-reported/corrected/retracted airport transfers and serves a
+daily airport-stop report aggregated by UTC departure date.
 """
 
 DEMO_DST_FALLBACK = {
@@ -67,19 +77,66 @@ DEMO_CONFLICTING_LINKS = {
     ],
 }
 
+DEMO_INGEST_REPORT = {
+    "records": [
+        {
+            "id": "XFR_1001",
+            "revision": 1,
+            "airport": "JFK",
+            "arrival_utc": "2024-11-03T06:30:00Z",
+            "departure_utc": "2024-11-03T08:00:00Z",
+        },
+        {
+            "id": "XFR_1002",
+            "revision": 1,
+            "airport": "ORD",
+            "arrival_utc": "2024-11-03T10:10:00Z",
+            "departure_utc": "2024-11-03T11:40:00Z",
+        },
+    ]
+}
+
+DEMO_INGEST_CORRECTION = {
+    "records": [
+        {
+            "id": "XFR_1001",
+            "revision": 2,
+            "airport": "LHR",
+            "arrival_utc": "2024-11-03T06:30:00Z",
+            "departure_utc": "2024-11-04T02:00:00Z",
+        }
+    ]
+}
+
+DEMO_INGEST_RETRACTION = {
+    "records": [
+        {"id": "XFR_1002", "revision": 2, "retracted": True},
+    ]
+}
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    db.ensure_schema()
+    yield
+
+
 app = FastAPI(
-    title="Scan Time Normalizer",
+    title="Air Cargo Transfer & Scan Time Service",
     description=DESCRIPTION,
-    version="1.0.0",
+    version="1.1.0",
+    lifespan=lifespan,
 )
 
 
 @app.get("/", include_in_schema=False)
 def root() -> dict:
     return {
-        "service": "scan-time-normalizer",
+        "service": "air-cargo-transfer-service",
         "docs": "/docs",
         "normalize": "POST /normalize",
+        "ingest": "POST /transfers",
+        "daily_report": "GET /reports/daily",
         "health": "/healthz",
     }
 
@@ -183,4 +240,166 @@ def normalize_endpoint(
             needs_review=sum(1 for r in records_out if r.status == "needs_review"),
         ),
         records=records_out,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Transfer ingestion: late report / correction / retraction
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/transfers",
+    response_model=IngestResponse,
+    responses={
+        409: {
+            "model": IngestConflictResponse,
+            "description": "Same id+revision with different content; entire batch rejected",
+        }
+    },
+    tags=["transfers"],
+    summary="Ingest transfer facts, corrections and retractions atomically",
+)
+@app.post("/transfers/ingest", include_in_schema=False, response_model=IngestResponse)
+@app.post("/transfers/batch", include_in_schema=False, response_model=IngestResponse)
+@app.post("/transfers/report", include_in_schema=False, response_model=IngestResponse)
+@app.post("/transfers/correction", include_in_schema=False, response_model=IngestResponse)
+@app.post("/transfers/retract", include_in_schema=False, response_model=IngestResponse)
+@app.post("/transfers/retraction", include_in_schema=False, response_model=IngestResponse)
+@app.post("/batch", include_in_schema=False, response_model=IngestResponse)
+@app.post("/ingest", include_in_schema=False, response_model=IngestResponse)
+@app.post("/api/ingest", include_in_schema=False, response_model=IngestResponse)
+@app.post("/api/v1/ingest", include_in_schema=False, response_model=IngestResponse)
+@app.post("/v1/ingest", include_in_schema=False, response_model=IngestResponse)
+@app.post("/api/transfers", include_in_schema=False, response_model=IngestResponse)
+@app.post("/api/v1/transfers", include_in_schema=False, response_model=IngestResponse)
+@app.post("/v1/transfers", include_in_schema=False, response_model=IngestResponse)
+def ingest_endpoint(
+    req: Annotated[
+        IngestBatch,
+        Body(
+            openapi_examples={
+                "late_report": {
+                    "summary": "Late-report two transfer facts",
+                    "description": "Times are the determined UTC instants produced by "
+                                   "/normalize. Each entry has id + positive revision.",
+                    "value": DEMO_INGEST_REPORT,
+                },
+                "correction": {
+                    "summary": "Correct airport and cross-day departure time",
+                    "description": "Revision 2 replaces revision 1. The old (JFK, 2024-11-03) "
+                                   "contribution is deducted and the new (LHR, 2024-11-04) "
+                                   "contribution is added in the same transaction.",
+                    "value": DEMO_INGEST_CORRECTION,
+                },
+                "retraction": {
+                    "summary": "Retract a transfer (id + revision only)",
+                    "description": "A retraction carries only id and revision. Its contribution "
+                                   "is removed; later deliveries of older revisions are ignored.",
+                    "value": DEMO_INGEST_RETRACTION,
+                },
+            }
+        ),
+    ],
+) -> IngestResponse | JSONResponse:
+    try:
+        outcome = db.ingest(req.records)
+    except db.BatchConflict as exc:
+        body = IngestConflictResponse(
+            message="The batch was rejected in full because at least one id/revision "
+                    "already exists with different content. Nothing was applied.",
+            conflicts=[RevisionConflictDetail(**item) for item in exc.conflicts],
+        )
+        return JSONResponse(status_code=409, content=body.model_dump(mode="json"))
+
+    return IngestResponse(
+        summary=outcome["summary"],
+        results=outcome["results"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Daily airport-stop report
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/reports/daily",
+    response_model=DailyReportResponse,
+    tags=["reports"],
+    summary="Daily airport-stop totals by UTC departure date",
+)
+@app.get("/reports", include_in_schema=False)
+@app.get("/report", include_in_schema=False)
+@app.get("/report/daily", include_in_schema=False)
+@app.get("/daily-report", include_in_schema=False)
+@app.get("/daily", include_in_schema=False)
+@app.get("/api/reports/daily", include_in_schema=False)
+@app.get("/api/v1/reports/daily", include_in_schema=False)
+@app.get("/v1/reports/daily", include_in_schema=False)
+def daily_report_endpoint(
+    airport: Annotated[
+        str | None,
+        Query(description="Exact airport filter, e.g. JFK."),
+    ] = None,
+    date_from: Annotated[
+        date | None,
+        Query(description="Inclusive lower bound on UTC departure date (YYYY-MM-DD)."),
+    ] = None,
+    date_to: Annotated[
+        date | None,
+        Query(description="Inclusive upper bound on UTC departure date (YYYY-MM-DD)."),
+    ] = None,
+    start_date: Annotated[date | None, Query(include_in_schema=False)] = None,
+    end_date: Annotated[date | None, Query(include_in_schema=False)] = None,
+    from_: Annotated[date | None, Query(alias="from", include_in_schema=False)] = None,
+    to_: Annotated[date | None, Query(alias="to", include_in_schema=False)] = None,
+    date_exact: Annotated[date | None, Query(alias="date", include_in_schema=False)] = None,
+    departure_date: Annotated[date | None, Query(include_in_schema=False)] = None,
+    airport_code: Annotated[str | None, Query(include_in_schema=False)] = None,
+    station: Annotated[str | None, Query(include_in_schema=False)] = None,
+) -> DailyReportResponse:
+    if airport is None:
+        airport = airport_code or station
+    if airport is not None:
+        airport = airport.strip() or None
+
+    lower = date_from or start_date or from_
+    upper = date_to or end_date or to_
+    if date_exact is not None or departure_date is not None:
+        exact = date_exact or departure_date
+        lower = lower or exact
+        upper = upper or exact
+    if lower is not None and upper is not None and lower > upper:
+        raise HTTPException(status_code=422, detail="date_from must be <= date_to")
+
+    outcome = db.daily_report(airport=airport, date_from=lower, date_to=upper)
+    return DailyReportResponse(
+        rows=[dict(row) for row in outcome["rows"]],
+        totals=outcome["totals"],
+    )
+
+
+@app.get(
+    "/reports/daily/{airport}",
+    response_model=DailyReportResponse,
+    include_in_schema=False,
+)
+@app.get(
+    "/reports/{airport}/daily",
+    response_model=DailyReportResponse,
+    include_in_schema=False,
+)
+def daily_report_by_airport(
+    airport: str,
+    date_from: Annotated[date | None, Query()] = None,
+    date_to: Annotated[date | None, Query()] = None,
+) -> DailyReportResponse:
+    airport = airport.strip()
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise HTTPException(status_code=422, detail="date_from must be <= date_to")
+    outcome = db.daily_report(airport=airport, date_from=date_from, date_to=date_to)
+    return DailyReportResponse(
+        rows=[dict(row) for row in outcome["rows"]],
+        totals=outcome["totals"],
     )

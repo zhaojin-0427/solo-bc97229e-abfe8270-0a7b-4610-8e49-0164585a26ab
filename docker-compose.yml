@@ -1,9 +1,16 @@
-name: scan-time-normalizer
+name: air-cargo-transfer-service
 
 services:
   api:
     build: .
-    image: scan-time-normalizer:latest
+    image: air-cargo-transfer-service:latest
     ports:
       - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/aircargo.db
+    volumes:
+      - aircargo-data:/data
     restart: unless-stopped
+
+volumes:
+  aircargo-data:
