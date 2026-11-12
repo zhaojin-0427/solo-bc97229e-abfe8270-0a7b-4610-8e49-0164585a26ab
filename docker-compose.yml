@@ -1,0 +1,9 @@
+name: scan-time-normalizer
+
+services:
+  api:
+    build: .
+    image: scan-time-normalizer:latest
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

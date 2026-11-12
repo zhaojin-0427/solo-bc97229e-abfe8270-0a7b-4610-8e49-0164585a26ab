@@ -1,0 +1,3 @@
+fastapi==0.162.4
+uvicorn[standard]==0.54.0
+tzdata==2026.6
